@@ -1,0 +1,42 @@
+Image 1
+
+Prompt:
+
+A lonely historic lighthouse standing on a rugged cliff beside the Atlantic Ocean, dramatic cloudy sky, distant ocean horizon, cinematic realistic photography, wide vertical composition, atmospheric lighting
+
+Scene idea: Introduction — the lighthouse.
+
+Image 2
+
+Prompt:
+
+A powerful lighthouse beam sweeping across dark ocean waves at night, a distant cargo ship sailing safely through the darkness, cinematic realistic photography, dramatic atmosphere, vertical composition
+
+Scene idea: The lighthouse guiding ships.
+
+Image 3
+
+Prompt:
+
+A violent Atlantic ocean storm at night, enormous waves crashing against jagged coastal rocks, a lighthouse illuminated in the background, a small ship struggling in rough water, cinematic realistic scene, vertical composition
+
+Scene idea: The storm and ship in danger.
+
+Image 4
+
+Prompt:
+
+An old lighthouse keeper inside a tall lighthouse tower during a violent storm, urgently activating a bright emergency beacon, dramatic interior lighting, rain visible through windows, cinematic realistic photography, vertical composition
+
+Scene idea: The keeper activates the emergency beacon.
+
+Image 5
+
+Prompt:
+
+A rescue ship safely approaching the coastline at sunrise after a terrible storm, warm golden sunlight, historic lighthouse shining in the background, calm ocean, sailors looking toward the lighthouse, cinematic realistic photography, vertical composition
+
+Scene idea: Resolution and sunrise.
+
+
+python -m frameforge.server

@@ -5,19 +5,31 @@ from frameforge.alignment import SceneAlignmentEngine
 from frameforge.models import ImageAsset, Timeline, TranscriptSegment, Word
 from frameforge.validation import TimelineValidationError, validate_timeline
 from frameforge.service import FrameForgeService
+from tests.helpers import create_real_image, create_audio_stub
 
 
 class PipelineTests(unittest.TestCase):
     def setUp(self):
-        self.images = [ImageAsset("ship", "ship.png", "ship.png", "Titanic ship leaving Southampton"), ImageAsset("iceberg", "ice.png", "ice.png", "Titanic striking an iceberg at night")]
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.tmp = Path(self.tmp_dir.name)
+        # Create visually-distinct real images for ship and iceberg
+        ship_path = create_real_image(self.tmp / "ship.png", theme="ocean", seed=1, label="ship")
+        iceberg_path = create_real_image(self.tmp / "ice.png", theme="arctic", seed=2, label="iceberg")
+        self.images = [
+            ImageAsset("ship", str(ship_path), "ship.png", "Titanic ship leaving Southampton"),
+            ImageAsset("iceberg", str(iceberg_path), "ice.png", "Titanic striking an iceberg at night"),
+        ]
         self.segments = [TranscriptSegment("The Titanic departed Southampton.", 0, 3, [Word("The",0,.2), Word("Titanic",.2,.8), Word("departed",.8,1.2), Word("Southampton.",1.2,3)]), TranscriptSegment("Four days later it struck an iceberg at night.", 3, 7, [Word("Four",3,3.2), Word("iceberg",5,5.5)])]
+
+    def tearDown(self):
+        self.tmp_dir.cleanup()
 
     def test_alignment_uses_meaningful_timestamps(self):
         scenes, method = SceneAlignmentEngine().align(self.segments, self.images, 7)
         self.assertEqual((scenes[0].start, scenes[-1].end), (0.0, 7))
         self.assertEqual(scenes[0].image_id, "ship")
         self.assertEqual(scenes[-1].image_id, "iceberg")
-        self.assertIn(method, {"semantic", "fallback"})
+        self.assertIn(method, {"three_way_multimodal", "semantic", "fallback"})
 
     def test_single_image_can_be_reused_as_one_continuous_scene(self):
         scenes, _ = SceneAlignmentEngine().align(self.segments, self.images[:1], 7)
@@ -25,12 +37,12 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(scenes[0].duration, 7)
 
     def test_validation_normalizes_small_float_gap(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            audio, image = Path(tmp)/"a.wav", Path(tmp)/"i.png"; audio.touch(); image.touch()
-            assets=[ImageAsset("a", str(image), "i.png", "anything")]
-            from frameforge.models import Scene
-            line=Timeline(str(audio), 3, [Scene("1","a",0,1,"a",.5), Scene("2","a",1.000001,3,"b",.5)], "fallback")
-            self.assertEqual(validate_timeline(line, assets).scenes[1].start, 1)
+        audio = create_audio_stub(self.tmp / "a.wav")
+        img_path = create_real_image(self.tmp / "i.png", theme="forest", seed=10)
+        assets=[ImageAsset("a", str(img_path), "i.png", "anything")]
+        from frameforge.models import Scene
+        line=Timeline(str(audio), 3, [Scene("1","a",0,1,"a",.5), Scene("2","a",1.000001,3,"b",.5)], "fallback")
+        self.assertEqual(validate_timeline(line, assets).scenes[1].start, 1)
 
     def test_validation_rejects_gap(self):
         from frameforge.models import Scene

@@ -1,1 +1,160 @@
-<!doctype html><html><head><meta charset="utf-8"><title>FrameForge</title><link rel="stylesheet" href="style.css"></head><body><main><h1>FrameForge</h1><p>Local narration-aware image synchronization. No paid API.</p><label>Upload voice-over <input id="audio" type="file" accept="audio/*"></label><p><small>FrameForge measures audio duration locally with FFprobe; no manual duration is needed.</small></p><h2>Images & prompts</h2><div id="images"></div><button id="add">Add image</button><button id="analyze">Analyze & Sync</button><button id="render" disabled>Render Video</button><p id="status"></p><h2>Timeline preview</h2><div id="timeline"></div><section id="rendered" hidden><h2>Rendered video</h2><video id="player" controls></video><p><a id="download" download>Download MP4</a></p></section><h2>Manual override</h2><textarea id="editor" rows="12" placeholder="Generated timeline JSON appears here for editing."></textarea><button id="save">Save edited timeline</button></main><script src="app.js"></script></body></html>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FrameForge V3 — Three-Way Multimodal AI Video Pipeline</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div class="app-container">
+    <header class="app-header">
+      <div class="brand">
+        <span class="logo-badge">V3</span>
+        <h1>FrameForge</h1>
+        <span class="subtitle">Three-Way Multimodal AI Video Mixer (Pixels + Prompts + Voiceover)</span>
+      </div>
+      <div class="header-status" id="headerStatus">Ready for 700 Images</div>
+    </header>
+
+    <main class="main-layout">
+      <!-- Left Panel: Assets Ingestion -->
+      <section class="panel asset-panel">
+        <h2>1. Ingest Assets</h2>
+
+        <div class="form-group">
+          <label>Voiceover Audio File</label>
+          <div class="drop-zone" id="audioDropZone">
+            <input type="file" id="audioInput" accept="audio/*" />
+            <div class="drop-content">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg>
+              <span id="audioFileName">Select Voiceover (.mp3, .wav, .m4a)</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label>Image Assets <span class="badge" id="imageCountBadge">0 / 700</span></label>
+          <div class="drop-zone" id="imageDropZone">
+            <input type="file" id="imagesInput" accept="image/*" multiple />
+            <div class="drop-content">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/></svg>
+              <span>Bulk Select Images (Up to 700)</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label>Optional Prompt Mapping <span class="badge prompt-badge">JSON / CSV</span></label>
+          <div class="drop-zone prompt-zone" id="promptDropZone">
+            <input type="file" id="promptInput" accept=".json,.csv,.txt" />
+            <div class="drop-content">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+              <span id="promptFileName">Upload Prompt File (.json or .csv)</span>
+            </div>
+          </div>
+          <div class="prompt-stats-banner hidden" id="promptStatsBanner">
+            <span id="promptStatsText">0 prompts mapped</span>
+          </div>
+        </div>
+
+        <div class="upload-progress-container hidden" id="uploadProgressBox">
+          <div class="progress-bar-bg"><div class="progress-bar-fill" id="uploadProgressBar"></div></div>
+          <span class="progress-label" id="uploadProgressLabel">Uploading...</span>
+        </div>
+
+        <div class="gemini-toggle-row">
+          <label class="toggle-label">
+            <span class="toggle-switch">
+              <input type="checkbox" id="geminiToggle" checked>
+              <span class="toggle-slider"></span>
+            </span>
+            <span class="toggle-text" id="geminiToggleText">Gemini ON</span>
+          </label>
+          <span class="gemini-status" id="geminiStatus">Checking...</span>
+        </div>
+
+        <button class="btn btn-primary" id="btnAnalyze" disabled>
+          <span class="btn-text">Synchronize Timeline (3-Way)</span>
+        </button>
+
+        <div class="stage-progress-card hidden" id="stageProgressCard">
+          <div class="stage-header">
+            <span class="stage-name" id="stageName">Initializing...</span>
+            <span class="stage-pct" id="stagePct">0%</span>
+          </div>
+          <div class="progress-bar-bg"><div class="progress-bar-fill" id="stageProgressBar"></div></div>
+          <p class="stage-msg" id="stageMsg">Processing assets...</p>
+        </div>
+      </section>
+
+      <!-- Center & Right: Timeline & Render -->
+      <section class="panel timeline-panel">
+        <div class="panel-header">
+          <h2>2. Synchronized Timeline</h2>
+          <div class="timeline-meta" id="timelineMeta">No timeline generated</div>
+          <div class="gemini-result-bar hidden" id="geminiResultBar">
+            <span class="gemini-result-label" id="geminiResultLabel">Gemini: --</span>
+          </div>
+        </div>
+
+        <div class="timeline-scroll-area" id="timelineContainer">
+          <div class="empty-state" id="emptyState">
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+            <p>Upload voiceover, images, and optional prompt file to generate synchronized scenes.</p>
+          </div>
+          <div class="scenes-list hidden" id="scenesList"></div>
+        </div>
+      </section>
+
+      <!-- Right Panel: Render & Export -->
+      <section class="panel render-panel">
+        <h2>3. Video Export</h2>
+
+        <div class="form-group">
+          <label>Resolution Preset</label>
+          <select id="presetSelect" class="form-select">
+            <option value="vertical">Vertical 9:16 (1080x1920) — Reels / Shorts / TikTok</option>
+            <option value="landscape">Landscape 16:9 (1920x1080) — YouTube / Web</option>
+            <option value="square">Square 1:1 (1080x1080) — Feed / Posts</option>
+            <option value="preview">Preview 9:16 (540x960) — Ultra Fast</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label>Image Fit Mode</label>
+          <select id="fitSelect" class="form-select">
+            <option value="cover">Cover / Smart Crop (Fill Frame)</option>
+            <option value="contain">Contain (Letterbox / Pillarbox)</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label>Render Engine Mode</label>
+          <select id="renderPathSelect" class="form-select">
+            <option value="fast">FAST PATH (Concat Demuxer — Instant for 700 Images)</option>
+            <option value="transition">TRANSITION PATH (Staged Crossfade / Fade)</option>
+          </select>
+        </div>
+
+        <button class="btn btn-success" id="btnRender" disabled>
+          <span class="btn-text">Render Video</span>
+        </button>
+
+        <div class="render-output-box hidden" id="renderOutputBox">
+          <div class="video-preview-wrapper">
+            <video id="renderedVideo" controls playsinline></video>
+          </div>
+          <div class="render-details" id="renderDetails"></div>
+          <a class="btn btn-secondary" id="btnDownload" href="#" download>Download MP4</a>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

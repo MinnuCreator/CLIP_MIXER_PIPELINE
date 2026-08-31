@@ -1,71 +1,311 @@
+"""FrameForge V3 HTTP API and Web Server with Async Processing & Prompt File Ingestion."""
 from __future__ import annotations
-import json, logging, mimetypes, os, shutil
-from http import HTTPStatus
+
+import json
+import logging
+import os
+import shutil
+import uuid
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
-from .models import ImageAsset, Scene, Timeline, TranscriptSegment, Word
-from .renderer import FFmpegRenderer, RenderError
+from typing import Any
+from urllib.parse import parse_qs, urlparse
+
+from .config import DEFAULT_CONFIG, FrameForgeConfig
+from .prompt_parser import PromptMappingParser
 from .service import FrameForgeService
 from .storage import TimelineStore
-from .transcript import TranscriptionError
 
-ROOT = Path(__file__).parent.parent; UPLOADS = ROOT / "uploads"; STATIC = ROOT / "static"
-
-
-def create_service(database_path: Path) -> FrameForgeService:
-    return FrameForgeService(TimelineStore(database_path))
-
-
-service = create_service(ROOT / "frameforge.db")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("frameforge.server")
 
-class App(SimpleHTTPRequestHandler):
-    def __init__(self, *args, **kwargs): super().__init__(*args, directory=str(STATIC), **kwargs)
-    def json(self, data, status=200):
-        body = json.dumps(data).encode(); self.send_response(status); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
-    def read_json(self): return json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode())
+
+def create_service(database_path: str | Path | None = None) -> FrameForgeService:
+    """Factory helper creating a FrameForgeService instance with the given database path."""
+    if database_path is not None:
+        store = TimelineStore(database_path)
+        cfg = FrameForgeConfig(db_path=Path(database_path))
+        return FrameForgeService(store=store, config=cfg)
+    return FrameForgeService()
+
+
+class FrameForgeHandler(SimpleHTTPRequestHandler):
+    def __init__(self, *args, config: FrameForgeConfig | None = None, **kwargs):
+        self.config = config or DEFAULT_CONFIG
+        self.service = FrameForgeService(config=self.config)
+        super().__init__(*args, directory=str(self.config.static_dir.resolve()), **kwargs)
+
+    def _send_json(self, status: int, payload: dict | list):
+        encoded = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def _parse_json_body(self) -> dict:
+        length = int(self.headers.get("Content-Length", 0))
+        if length == 0:
+            return {}
+        return json.loads(self.rfile.read(length).decode("utf-8"))
+
     def do_GET(self):
-        parts = urlparse(self.path).path.strip("/").split("/")
-        if len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3:] == ["video-sync", "timeline"]:
-            result = service.store.get_latest(parts[2]); return self.json(result or {"error": "No timeline exists."}, 404 if not result else 200)
-        return super().do_GET()
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        # Health / diagnostics endpoint
+        if path == "/api/health":
+            try:
+                vis = self.service.visual_status()
+                # V5: add LLM status
+                from .llm import GeminiBeatPlanner
+                planner = GeminiBeatPlanner(self.config)
+                vis["llm_status"] = {
+                    "model": self.config.llm_model,
+                    "configured": planner.is_available,
+                    "api_key_set": bool(self.config.llm_api_key),
+                    "enabled": self.config.llm_enabled,
+                }
+                # full_multimodal_ready reflects CLIP status only (LLM is optional)
+                # Do NOT downgrade readiness when LLM is disabled.
+                self._send_json(200, vis)
+            except Exception as exc:
+                self._send_json(200, {"status": "error", "error": str(exc)})
+            return
+
+        # Asynchronous job status endpoint
+        if path.startswith("/api/jobs/"):
+            job_id = path.split("/")[-1]
+            job = self.service.job_manager.get_job(job_id)
+            if not job:
+                self._send_json(404, {"error": "Job not found"})
+                return
+            self._send_json(200, job.as_dict())
+            return
+
+        # Fetch latest timeline for project
+        if path.startswith("/timeline/"):
+            project_id = path.split("/")[-1]
+            record = self.service.store.get_latest(project_id)
+            if not record:
+                self._send_json(404, {"error": "No timeline found for project."})
+                return
+            self._send_json(200, record["timeline"])
+            return
+
+        # Serve static renders
+        if path.startswith("/renders/"):
+            rel_path = path.replace("/renders/", "")
+            file_path = self.config.renders_dir / rel_path
+            if file_path.is_file():
+                self.send_response(200)
+                self.send_header("Content-Type", "video/mp4")
+                self.send_header("Content-Length", str(file_path.stat().st_size))
+                self.end_headers()
+                with open(file_path, "rb") as f:
+                    shutil.copyfileobj(f, self.wfile)
+                return
+
+        # Default static file serving
+        super().do_GET()
+
     def do_POST(self):
-        parts = urlparse(self.path).path.strip("/").split("/")
-        if parts == ["api", "uploads"]:
-            name = Path(self.headers.get("X-Filename", "upload.bin")).name
-            if not name or name == ".": return self.json({"error":"Missing upload filename."}, 400)
-            UPLOADS.mkdir(exist_ok=True)
-            destination = UPLOADS / name
-            destination.write_bytes(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
-            return self.json({"file_path": str(destination.resolve()), "filename": name})
-        if len(parts) != 5 or parts[:2] != ["api", "projects"] or parts[3] != "video-sync": return self.json({"error":"Unknown endpoint"}, 404)
-        try:
-            body = self.read_json(); project_id, action = parts[2], parts[4]
-            if action == "analyze":
-                transcript = [TranscriptSegment(x["text"], x["start"], x["end"], [Word(**w) for w in x.get("words",[])]) for x in body.get("transcript", [])] or None
-                # The backend measures uploaded audio itself. Do not allow an
-                # empty browser number input (which JavaScript converts to 0)
-                # to invalidate a successful Whisper transcription.
-                supplied_duration = float(body["audio_duration"]) if transcript and body.get("audio_duration") is not None else None
-                return self.json(service.analyze(project_id, body["audio_file"], supplied_duration, body["images"], transcript))
-            if action == "render":
-                render_dir = STATIC / "renders"; render_dir.mkdir(exist_ok=True)
-                output = render_dir / f"{project_id}-synced.mp4"
-                result = service.render(project_id, str(output), body.get("preset", "vertical"), body.get("fit", "cover"), body.get("transition", "cut"), body.get("ffmpeg_path"))
-                return self.json({"status":"rendered", "output": result["output"], "url": f"/renders/{output.name}", "metadata": result["metadata"]})
-        except (ValueError, KeyError, RenderError, TranscriptionError) as exc: return self.json({"error":str(exc)}, 400)
-        except Exception:
-            logger.exception("Unhandled error in POST %s", self.path)
-            return self.json({"error":"The request could not be processed. Check server logs."}, 500)
-    def do_PATCH(self):
-        parts = urlparse(self.path).path.strip("/").split("/")
-        if len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3:] == ["video-sync", "timeline"]:
-            try: service.update(parts[2], self.read_json()); return self.json({"status":"saved"})
-            except Exception: return self.json({"error":"Timeline could not be saved."}, 400)
-        self.json({"error":"Unknown endpoint"}, 404)
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        # 1. Parse prompt file preview endpoint
+        if path == "/api/prompts/parse":
+            try:
+                body = self._parse_json_body()
+                raw_text = body.get("content", "")
+                if raw_text.strip().startswith("{") or raw_text.strip().startswith("["):
+                    mapping = PromptMappingParser.parse_json(raw_text)
+                else:
+                    mapping = PromptMappingParser.parse_csv(raw_text)
+
+                self._send_json(200, {"status": "ok", "total_mapped": len(mapping), "sample": dict(list(mapping.items())[:10])})
+            except Exception as exc:
+                self._send_json(400, {"error": f"Failed to parse prompt file: {exc}"})
+            return
+
+        # 2. Upload file endpoint (chunked streaming)
+        if path == "/upload":
+            content_type = self.headers.get("Content-Type", "")
+            length = int(self.headers.get("Content-Length", 0))
+
+            if "multipart/form-data" in content_type:
+                boundary = content_type.split("boundary=")[-1].strip().encode()
+                data = self.rfile.read(length)
+                parts = data.split(b"--" + boundary)
+
+                saved_files = []
+                for part in parts:
+                    if b"Content-Disposition" in part and b"filename=" in part:
+                        headers_part, file_body = part.split(b"\r\n\r\n", 1)
+                        file_body = file_body.rstrip(b"\r\n")
+                        disposition = headers_part.decode("utf-8", errors="replace")
+                        for line in disposition.split("\r\n"):
+                            if "filename=" in line:
+                                fn = line.split("filename=")[-1].strip('"\r\n ')
+                                clean_fn = Path(fn).name
+                                self.config.uploads_dir.mkdir(parents=True, exist_ok=True)
+                                out_file = self.config.uploads_dir / clean_fn
+                                out_file.write_bytes(file_body)
+                                saved_files.append(
+                                    {
+                                        "filename": clean_fn,
+                                        "file_path": str(out_file.resolve()),
+                                        "size": len(file_body),
+                                    }
+                                )
+
+                self._send_json(200, {"uploaded": saved_files})
+                return
+
+        # 3. Asynchronous timeline analysis
+        if path == "/analyze-async":
+            try:
+                body = self._parse_json_body()
+                project_id = body.get("project_id", str(uuid.uuid4())[:8])
+                audio_file = body["audio_file"]
+                audio_dur = body.get("audio_duration")
+                images = body["images"]
+                transcript = body.get("transcript")
+                prompts = body.get("prompts")
+
+                llm_enabled = body.get("llm_enabled")
+
+                job_id = self.service.analyze_async(
+                    project_id,
+                    audio_file,
+                    audio_dur,
+                    images,
+                    transcript=transcript,
+                    prompts=prompts,
+                    llm_enabled=llm_enabled,
+                )
+                self._send_json(202, {"job_id": job_id, "project_id": project_id})
+            except Exception as exc:
+                logger.error("Analyze-async request failed: %s", exc)
+                self._send_json(400, {"error": str(exc)})
+            return
+
+        # 4. Synchronous timeline analysis
+        if path == "/analyze":
+            try:
+                body = self._parse_json_body()
+                project_id = body.get("project_id", str(uuid.uuid4())[:8])
+                audio_file = body["audio_file"]
+                audio_dur = body.get("audio_duration")
+                images = body["images"]
+                transcript = body.get("transcript")
+                prompts = body.get("prompts")
+
+                llm_enabled = body.get("llm_enabled")
+
+                result = self.service.analyze(
+                    project_id,
+                    audio_file,
+                    audio_dur,
+                    images,
+                    transcript=transcript,
+                    prompts=prompts,
+                    llm_enabled=llm_enabled,
+                )
+                self._send_json(200, result)
+            except Exception as exc:
+                logger.error("Analyze request failed: %s", exc)
+                self._send_json(400, {"error": str(exc)})
+            return
+
+        # 5. Asynchronous video rendering
+        if path == "/render-async":
+            try:
+                body = self._parse_json_body()
+                project_id = body["project_id"]
+                preset = body.get("preset", "vertical")
+                fit = body.get("fit", "cover")
+                transition = body.get("transition", "cut")
+                render_profile = body.get("render_profile", "balanced")
+                render_path = body.get("render_path")
+                output_name = f"{project_id}_{preset}_{int(uuid.uuid1().time)}.mp4"
+                self.config.renders_dir.mkdir(parents=True, exist_ok=True)
+                output_path = str((self.config.renders_dir / output_name).resolve())
+
+                job_id = self.service.render_async(
+                    project_id,
+                    output_path,
+                    preset=preset,
+                    fit=fit,
+                    transition=transition,
+                    render_path=render_path,
+                    render_profile=render_profile,
+                )
+                self._send_json(202, {"job_id": job_id, "output_url": f"/renders/{output_name}"})
+            except Exception as exc:
+                logger.error("Render-async request failed: %s", exc)
+                self._send_json(400, {"error": str(exc)})
+            return
+
+        # 6. Synchronous video rendering
+        if path == "/render":
+            try:
+                body = self._parse_json_body()
+                project_id = body["project_id"]
+                preset = body.get("preset", "vertical")
+                fit = body.get("fit", "cover")
+                transition = body.get("transition", "cut")
+                render_profile = body.get("render_profile", "balanced")
+                output_name = f"{project_id}_{preset}_{int(uuid.uuid1().time)}.mp4"
+                self.config.renders_dir.mkdir(parents=True, exist_ok=True)
+                output_path = str((self.config.renders_dir / output_name).resolve())
+
+                result = self.service.render(
+                    project_id,
+                    output_path,
+                    preset=preset,
+                    fit=fit,
+                    transition=transition,
+                    render_profile=render_profile,
+                )
+                result["output_url"] = f"/renders/{output_name}"
+                self._send_json(200, result)
+            except Exception as exc:
+                logger.error("Render request failed: %s", exc)
+                self._send_json(400, {"error": str(exc)})
+            return
+
+        # 7. Update timeline manually
+        if path.startswith("/timeline/"):
+            try:
+                project_id = path.split("/")[-1]
+                body = self._parse_json_body()
+                self.service.update(project_id, body)
+                self._send_json(200, {"status": "updated"})
+            except Exception as exc:
+                self._send_json(400, {"error": str(exc)})
+            return
+
+        self._send_json(404, {"error": "Endpoint not found"})
+
+
+def run_server(host: str = "127.0.0.1", port: int = 8000, config: FrameForgeConfig | None = None):
+    cfg = config or DEFAULT_CONFIG
+    cfg.uploads_dir.mkdir(parents=True, exist_ok=True)
+    cfg.renders_dir.mkdir(parents=True, exist_ok=True)
+
+    def handler_factory(*args, **kwargs):
+        return FrameForgeHandler(*args, config=cfg, **kwargs)
+
+    server = ThreadingHTTPServer((host, port), handler_factory)
+    logger.info("FrameForge V3 Server running on http://%s:%d", host, port)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        logger.info("Shutting down FrameForge server...")
+    finally:
+        server.server_close()
+
 
 if __name__ == "__main__":
-    print("FrameForge available at http://127.0.0.1:8000")
-    ThreadingHTTPServer(("127.0.0.1", 8000), App).serve_forever()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    run_server()
